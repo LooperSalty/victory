@@ -6751,8 +6751,29 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!()
+                    };
+                    let op0 = *v.src.first().ok_or("a missing operand")?;
+                    let mut x = match self.src0 {
+                        Some(x) => x,
+                        None => {
+                            let x = self.operand(inst, &op0)?;
+                            match Self::sdwa_src(inst, 0) {
+                                Some((sel, sext)) => self.select_bits(x, sel, sext),
+                                None => x,
+                            }
+                        }
+                    };
+                    if v.abs & 1 != 0 {
+                        let m = self.s.m.i32(0x7FFF_FFFF);
+                        x = self.s.m.bin(c, Bin::And, x, m);
+                    }
+                    if v.neg & 1 != 0 {
+                        let s = self.s.m.i32(0x8000_0000);
+                        x = self.s.m.bin(c, Bin::Xor, x, s);
+                    }
+                    x
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
