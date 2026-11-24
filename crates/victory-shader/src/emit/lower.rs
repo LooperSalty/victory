@@ -1807,22 +1807,27 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
-                let r = self.s.op(
-                    c,
-                    &format!("wavePrefixOp.{sfx}"),
-                    Attr::NoUnwind,
-                    ty,
-                    121,
-                    &[arg, k0, k1],
-                );
+                let (r, half_total) = if op == Op::AddF {
+                    self.float_wave_prefix_sum(arg)
+                } else {
+                    let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                    let r = self.s.op(
+                        c,
+                        &format!("wavePrefixOp.{sfx}"),
+                        Attr::NoUnwind,
+                        ty,
+                        121,
+                        &[arg, k0, k1],
+                    );
+                    let half_total = self.s.m.bin(c, Bin::Add, r, arg);
+                    (r, half_total)
+                };
                 if self.emulating_wave64() {
                     if self.guard_depth > 0
                         || !self.uniform.get(self.cur_ir).copied().unwrap_or(false)
                     {
                         return Err("a wave prefix in divergent control flow");
                     }
-                    let half_total = self.s.m.bin(c, Bin::Add, r, arg);
                     let half_total_bits = if float {
                         self.as_int(half_total)
                     } else {
@@ -1848,11 +1853,7 @@ impl<'a> Lower<'a> {
                     let in_h0 = self.s.m.cmp(self.cur, pred::IULT, console_lane, k32);
                     return Ok(self.s.m.select(self.cur, in_h0, local_bits, combined));
                 }
-                if inclusive {
-                    self.s.m.bin(c, Bin::Add, r, arg)
-                } else {
-                    r
-                }
+                if inclusive { half_total } else { r }
             }
             (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
             (Op::Or | Op::And | Op::Xor, None) => {
@@ -1891,6 +1892,108 @@ impl<'a> Lower<'a> {
             return Ok(self.apply_wave_op(op, h0, h1));
         }
         Ok(local_bits)
+    }
+
+    /// Exact IEEE-754 float wave prefix sum over active hardware lanes.
+    ///
+    /// Returns `(exclusive, inclusive)` in `f32`. Uses an active-lane
+    /// Kogge-Stone scan via `waveReadLaneAt` instead of `dx.op.wavePrefixOp.f32`,
+    /// which some drivers lower as `inclusive_scan - x` and corrupt when a
+    /// lane's own term is `NaN`, `±infinity`, or large enough to round off
+    /// smaller terms.
+    fn float_wave_prefix_sum(&mut self, arg: V) -> (V, V) {
+        let i32t = self.s.t.i32;
+        let c = self.cur;
+        let lane = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let ktrue = self.s.m.bool(true);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[ktrue]);
+        let b0 = self.s.m.extract(c, ballot, 0);
+        let wave64_hw = self.wave64 != Wave64Mode::Wave32;
+        let b1 = wave64_hw.then(|| self.s.m.extract(c, ballot, 1));
+        let (k0, k1, k31, k32) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+        );
+
+        let max_shift = if wave64_hw { 6 } else { 5 };
+        let mut acc = arg;
+        for shift in 0..max_shift {
+            let ks = self.s.m.i32(1 << shift);
+            let in_range = self.s.m.cmp(c, pred::IUGE, lane, ks);
+            let raw_src = self.s.m.bin(c, Bin::Sub, lane, ks);
+            let safe_idx = self.s.m.select(c, in_range, raw_src, k0);
+            let src_on = if let Some(b1) = b1 {
+                let in_lo = self.s.m.cmp(c, pred::IULT, safe_idx, k32);
+                let word = self.s.m.select(c, in_lo, b0, b1);
+                let bit = self.s.m.bin(c, Bin::And, safe_idx, k31);
+                let mask = self.s.m.bin(c, Bin::Shl, k1, bit);
+                let masked = self.s.m.bin(c, Bin::And, word, mask);
+                self.s.m.cmp(c, pred::NE, masked, k0)
+            } else {
+                let mask = self.s.m.bin(c, Bin::Shl, k1, safe_idx);
+                let masked = self.s.m.bin(c, Bin::And, b0, mask);
+                self.s.m.cmp(c, pred::NE, masked, k0)
+            };
+            let has_src = self.s.m.bin(c, Bin::And, in_range, src_on);
+            let safe_src = self.s.m.select(c, has_src, raw_src, lane);
+            let acc_bits = self.as_int(acc);
+            let partner_bits = self.read_lane(acc_bits, safe_src);
+            let partner = self.as_float(partner_bits);
+            let sum = self.s.m.bin(c, Bin::Add, partner, acc);
+            acc = self.s.m.select(c, has_src, sum, acc);
+        }
+        let incl = acc;
+
+        let (has_prev, prev_lane) = if let Some(b1) = b1 {
+            let in_hi = self.s.m.cmp(c, pred::IUGE, lane, k32);
+            let lo_shift = self.s.m.select(c, in_hi, k0, lane);
+            let lo_pow = self.s.m.bin(c, Bin::Shl, k1, lo_shift);
+            let lo_limit = self.s.m.bin(c, Bin::Sub, lo_pow, k1);
+            let lo_masked = self.s.m.bin(c, Bin::And, b0, lo_limit);
+            let lo_mask = self.s.m.select(c, in_hi, b0, lo_masked);
+            let lane_sub = self.s.m.bin(c, Bin::Sub, lane, k32);
+            let hi_shift = self.s.m.select(c, in_hi, lane_sub, k0);
+            let hi_pow = self.s.m.bin(c, Bin::Shl, k1, hi_shift);
+            let hi_limit = self.s.m.bin(c, Bin::Sub, hi_pow, k1);
+            let hi_masked = self.s.m.bin(c, Bin::And, b1, hi_limit);
+            let hi_mask = self.s.m.select(c, in_hi, hi_masked, k0);
+            let has_hi = self.s.m.cmp(c, pred::NE, hi_mask, k0);
+            let has_lo = self.s.m.cmp(c, pred::NE, lo_mask, k0);
+            let has_prev = self.s.m.bin(c, Bin::Or, has_hi, has_lo);
+            let active_mask = self.s.m.select(c, has_hi, hi_mask, lo_mask);
+            let safe_mask = self.s.m.select(c, has_prev, active_mask, k1);
+            let clz = self
+                .s
+                .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[safe_mask]);
+            let bit_idx = self.s.m.bin(c, Bin::Sub, k31, clz);
+            let hi_lane = self.s.m.bin(c, Bin::Add, bit_idx, k32);
+            (has_prev, self.s.m.select(c, has_hi, hi_lane, bit_idx))
+        } else {
+            let below_pow = self.s.m.bin(c, Bin::Shl, k1, lane);
+            let below_limit = self.s.m.bin(c, Bin::Sub, below_pow, k1);
+            let below_mask = self.s.m.bin(c, Bin::And, b0, below_limit);
+            let has_prev = self.s.m.cmp(c, pred::NE, below_mask, k0);
+            let safe_mask = self.s.m.select(c, has_prev, below_mask, k1);
+            let clz = self
+                .s
+                .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[safe_mask]);
+            (has_prev, self.s.m.bin(c, Bin::Sub, k31, clz))
+        };
+
+        let safe_prev = self.s.m.select(c, has_prev, prev_lane, lane);
+        let incl_bits = self.as_int(incl);
+        let prev_bits = self.read_lane(incl_bits, safe_prev);
+        let prev_val = self.as_float(prev_bits);
+        let fzero = self.s.m.f32(0);
+        let excl = self.s.m.select(c, has_prev, prev_val, fzero);
+        (excl, incl)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {

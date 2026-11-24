@@ -908,4 +908,310 @@ mod gpu {
             true,
         );
     }
+
+    #[test]
+    fn gpu_32_threads_float_wave_prefix_sum_nan_inf_large() {
+        // Issue #1172: float wave prefix sum must not corrupt a lane's result
+        // when that lane's own term is NaN, +infinity, or 2^60.
+        fn dpp_mov_row_shr1(dst: u32, vsrc0: u32) -> [u32; 2] {
+            [
+                vop1(dst, 0x01, 0xFA),
+                vsrc0 | (0x111 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+            ]
+        }
+        fn v_mov_lit(dst: u32, bits: u32) -> [u32; 2] {
+            [vop1(dst, 0x01, LIT), bits]
+        }
+
+        let cases: &[(&str, u32, u32)] = &[
+            ("nan_lane0", 0, 0x7FC0_0000),
+            ("nan_lane9", 9, 0x7FC0_0000),
+            ("pow2_60_lane11", 11, 0x5D80_0000),
+            ("pos_inf_lane11", 11, 0x7F80_0000),
+        ];
+
+        for &(label, special_lane, special_bits) in cases {
+            let mut code = vec![
+                v_and_b32(3, inline_u(1), 0), // v3 = tid & 1
+                v_cmp_eq_u32(inline_u(0), 3), // vcc = even lanes
+            ];
+            code.extend_from_slice(&v_mov_lit(4, (-0.5f32).to_bits()));
+            code.extend_from_slice(&v_mov_lit(5, (0.25f32).to_bits()));
+            code.extend_from_slice(&v_cndmask_b32(2, vgpr(5), vgpr(4), VCC));
+            code.push(v_cmp_eq_u32(inline_u(special_lane), 0));
+            code.extend_from_slice(&v_mov_lit(6, special_bits));
+            code.extend_from_slice(&v_cndmask_b32(2, vgpr(2), vgpr(6), VCC));
+            // Whole-wave float inclusive prefix sum (64-lane GFX10 pattern;
+            // [32, 1, 1] dispatches 1 Wave32 so it exercises the 32-lane fast path):
+            code.push(s_or_saveexec_b64(6, NEG_ONE));
+            code.extend_from_slice(&v_cndmask_b32(10, inline_u(0), vgpr(2), 6));
+            for shift in [0x111u32, 0x112, 0x114, 0x118] {
+                code.extend_from_slice(&dpp_row_shr(0x03, 10, 10, 10, shift, 0xF));
+            }
+            code.push(v_mov_b32(11, vgpr(10)));
+            code.extend_from_slice(&v_readlane_b32(12, 10, inline_u(15)));
+            code.extend_from_slice(&v_readlane_b32(13, 10, inline_u(31)));
+            code.extend_from_slice(&v_readlane_b32(14, 10, inline_u(47)));
+            code.push(vop1(4, 0x01, 12));
+            code.push(vop2(0x03, 4, 13, 4));
+            code.push(vop1(5, 0x01, 14));
+            code.push(vop2(0x03, 5, vgpr(4), 5));
+            code.push(s_mov_b32(EXEC_LO, LIT));
+            code.push(0xFFFF_0000);
+            code.push(s_mov_b32(EXEC_HI, inline_u(0)));
+            code.push(vop2(0x03, 11, 12, 11));
+            code.push(s_mov_b32(EXEC_LO, inline_u(0)));
+            code.push(s_mov_b32(EXEC_HI, LIT));
+            code.push(0x0000_FFFF);
+            code.push(vop2(0x03, 11, vgpr(4), 11));
+            code.push(s_mov_b32(EXEC_HI, LIT));
+            code.push(0xFFFF_0000);
+            code.push(vop2(0x03, 11, vgpr(5), 11));
+            // Exclusive prefix: shift v11 right by 1 and patch lanes 16, 32, 48.
+            code.push(s_mov_b64(EXEC_LO, NEG_ONE));
+            code.push(v_mov_b32(12, inline_u(0)));
+            code.extend_from_slice(&dpp_mov_row_shr1(12, 11));
+            code.push(s_mov_b32(EXEC_LO, LIT));
+            code.push(0x0001_0000);
+            code.push(s_mov_b32(EXEC_HI, inline_u(0)));
+            code.push(v_mov_b32(12, 12));
+            code.push(s_mov_b32(EXEC_LO, inline_u(0)));
+            code.push(s_mov_b32(EXEC_HI, LIT));
+            code.push(0x0000_0001);
+            code.push(v_mov_b32(12, vgpr(4)));
+            code.push(s_mov_b32(EXEC_HI, LIT));
+            code.push(0x0001_0000);
+            code.push(v_mov_b32(12, vgpr(5)));
+            code.push(s_mov_b64(EXEC_LO, 6));
+            // Store excl at tid*2 and incl at tid*2+1:
+            code.push(v_lshlrev_b32(20, inline_u(1), 0));
+            emit_uav_store(&mut code, 12, 20);
+            code.push(v_add_nc_u32(21, inline_u(1), 20));
+            emit_uav_store(&mut code, 11, 21);
+            code.push(S_ENDPGM);
+
+            let prog = make_cs_program(&code, [32, 1, 1], 0, false);
+            let terms: Vec<f32> = (0..32u32)
+                .map(|l| {
+                    if l == special_lane {
+                        f32::from_bits(special_bits)
+                    } else if l % 2 == 0 {
+                        -0.5
+                    } else {
+                        0.25
+                    }
+                })
+                .collect();
+
+            with_hosts(|hosts| {
+                for (warp_idx, host) in hosts.iter().enumerate() {
+                    let Some(host) = host else { continue };
+                    let mut modes = vec![Wave64Mode::Emulate];
+                    if host.supports_wave32() {
+                        modes.push(Wave64Mode::Wave32);
+                    }
+                    for mode in modes {
+                        let shader = emit_cs(&prog, mode)
+                            .unwrap_or_else(|e| panic!("{label} ({mode:?}): {e}"));
+                        if let Ok(mut v) = super::super::validator::Validator::load(
+                            super::super::validator::Validator::default_path().as_deref(),
+                        ) {
+                            v.validate(&mut shader.dxil.clone())
+                                .unwrap_or_else(|e| panic!("{label} ({mode:?}) validate: {e}"));
+                        }
+                        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+                        let out = host
+                            .dispatch(
+                                &root,
+                                &pso,
+                                &Dispatch {
+                                    roots: Vec::new(),
+                                    views: &[View::RawUav(64)],
+                                    samplers: &[],
+                                    groups: [1, 1, 1],
+                                },
+                            )
+                            .unwrap();
+                        let got = &out[0];
+                        let mut acc = 0.0f32;
+                        for (lane, &t) in terms.iter().enumerate() {
+                            let got_excl = f32::from_bits(got[lane * 2]);
+                            let got_incl = f32::from_bits(got[lane * 2 + 1]);
+                            let exp_excl = acc;
+                            acc += t;
+                            let exp_incl = acc;
+                            if exp_excl.is_nan() {
+                                assert!(
+                                    got_excl.is_nan(),
+                                    "{label} ({mode:?}, warp={warp_idx}) lane {lane} excl: expected NaN, got {got_excl} (0x{:08x})",
+                                    got[lane * 2]
+                                );
+                            } else {
+                                assert_eq!(
+                                    got_excl.to_bits(),
+                                    exp_excl.to_bits(),
+                                    "{label} ({mode:?}, warp={warp_idx}) lane {lane} excl: got {got_excl} (0x{:08x}), expected {exp_excl} (0x{:08x})",
+                                    got[lane * 2],
+                                    exp_excl.to_bits()
+                                );
+                            }
+                            if exp_incl.is_nan() {
+                                assert!(
+                                    got_incl.is_nan(),
+                                    "{label} ({mode:?}, warp={warp_idx}) lane {lane} incl: expected NaN, got {got_incl} (0x{:08x})",
+                                    got[lane * 2 + 1]
+                                );
+                            } else {
+                                assert_eq!(
+                                    got_incl.to_bits(),
+                                    exp_incl.to_bits(),
+                                    "{label} ({mode:?}, warp={warp_idx}) lane {lane} incl: got {got_incl} (0x{:08x}), expected {exp_incl} (0x{:08x})",
+                                    got[lane * 2 + 1],
+                                    exp_incl.to_bits()
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn gpu_64_threads_float_wave_prefix_sum_nan_inf_large() {
+        // Same #1172 check across 64 lanes (emulating_wave64 cross-half merge + Emulate).
+        fn dpp_mov_row_shr1(dst: u32, vsrc0: u32) -> [u32; 2] {
+            [
+                vop1(dst, 0x01, 0xFA),
+                vsrc0 | (0x111 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+            ]
+        }
+        fn v_mov_lit(dst: u32, bits: u32) -> [u32; 2] {
+            [vop1(dst, 0x01, LIT), bits]
+        }
+
+        let mut code = vec![v_and_b32(3, inline_u(1), 0), v_cmp_eq_u32(inline_u(0), 3)];
+        code.extend_from_slice(&v_mov_lit(4, (-0.5f32).to_bits()));
+        code.extend_from_slice(&v_mov_lit(5, (0.25f32).to_bits()));
+        code.extend_from_slice(&v_cndmask_b32(2, vgpr(5), vgpr(4), VCC));
+        // Lane 11 (half 0) = 2^60; lane 40 (half 1) = +inf.
+        code.push(v_cmp_eq_u32(inline_u(11), 0));
+        code.extend_from_slice(&v_mov_lit(6, 0x5D80_0000));
+        code.extend_from_slice(&v_cndmask_b32(2, vgpr(2), vgpr(6), VCC));
+        code.push(v_cmp_eq_u32(inline_u(40), 0));
+        code.extend_from_slice(&v_mov_lit(6, 0x7F80_0000));
+        code.extend_from_slice(&v_cndmask_b32(2, vgpr(2), vgpr(6), VCC));
+
+        code.push(s_or_saveexec_b64(6, NEG_ONE));
+        code.extend_from_slice(&v_cndmask_b32(10, inline_u(0), vgpr(2), 6));
+        for shift in [0x111u32, 0x112, 0x114, 0x118] {
+            code.extend_from_slice(&dpp_row_shr(0x03, 10, 10, 10, shift, 0xF));
+        }
+        code.push(v_mov_b32(11, vgpr(10)));
+        code.extend_from_slice(&v_readlane_b32(12, 10, inline_u(15)));
+        code.extend_from_slice(&v_readlane_b32(13, 10, inline_u(31)));
+        code.extend_from_slice(&v_readlane_b32(14, 10, inline_u(47)));
+        code.push(vop1(4, 0x01, 12)); // v4 = s12
+        code.push(vop2(0x03, 4, 13, 4)); // v4 = s12 + s13
+        code.push(vop1(5, 0x01, 14)); // v5 = s14
+        code.push(vop2(0x03, 5, vgpr(4), 5)); // v5 = s12 + s13 + s14
+        // Apply cross-row offsets to rows 1, 2, 3:
+        code.push(s_mov_b32(EXEC_LO, LIT));
+        code.push(0xFFFF_0000);
+        code.push(s_mov_b32(EXEC_HI, inline_u(0)));
+        code.push(vop2(0x03, 11, 12, 11));
+        code.push(s_mov_b32(EXEC_LO, inline_u(0)));
+        code.push(s_mov_b32(EXEC_HI, LIT));
+        code.push(0x0000_FFFF);
+        code.push(vop2(0x03, 11, vgpr(4), 11));
+        code.push(s_mov_b32(EXEC_HI, LIT));
+        code.push(0xFFFF_0000);
+        code.push(vop2(0x03, 11, vgpr(5), 11));
+
+        // Exclusive prefix: shift v11 right by 1 and patch lanes 16, 32, 48.
+        code.push(s_mov_b64(EXEC_LO, NEG_ONE));
+        code.push(v_mov_b32(12, inline_u(0)));
+        code.extend_from_slice(&dpp_mov_row_shr1(12, 11));
+        code.push(s_mov_b32(EXEC_LO, LIT));
+        code.push(0x0001_0000);
+        code.push(s_mov_b32(EXEC_HI, inline_u(0)));
+        code.push(v_mov_b32(12, 12)); // s12 at lane 16
+        code.push(s_mov_b32(EXEC_LO, inline_u(0)));
+        code.push(s_mov_b32(EXEC_HI, LIT));
+        code.push(0x0000_0001);
+        code.push(v_mov_b32(12, vgpr(4))); // v4 at lane 32
+        code.push(s_mov_b32(EXEC_HI, LIT));
+        code.push(0x0001_0000);
+        code.push(v_mov_b32(12, vgpr(5))); // v5 at lane 48
+        code.push(s_mov_b64(EXEC_LO, 6));
+
+        code.push(v_lshlrev_b32(20, inline_u(1), 0));
+        emit_uav_store(&mut code, 12, 20);
+        code.push(v_add_nc_u32(21, inline_u(1), 20));
+        emit_uav_store(&mut code, 11, 21);
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [64, 1, 1], 0, false);
+        let terms: Vec<f32> = (0..64u32)
+            .map(|l| match l {
+                11 => f32::from_bits(0x5D80_0000),
+                40 => f32::from_bits(0x7F80_0000),
+                _ if l % 2 == 0 => -0.5,
+                _ => 0.25,
+            })
+            .collect();
+
+        with_hosts(|hosts| {
+            for (warp_idx, host) in hosts.iter().enumerate() {
+                let Some(host) = host else { continue };
+                let mut modes = vec![Wave64Mode::Emulate];
+                if host.supports_wave32() {
+                    modes.push(Wave64Mode::Wave32);
+                }
+                for mode in modes {
+                    let shader = emit_cs(&prog, mode)
+                        .unwrap_or_else(|e| panic!("wave64_f32_prefix ({mode:?}): {e}"));
+                    if let Ok(mut v) = super::super::validator::Validator::load(
+                        super::super::validator::Validator::default_path().as_deref(),
+                    ) {
+                        v.validate(&mut shader.dxil.clone()).unwrap_or_else(|e| {
+                            panic!("wave64_f32_prefix ({mode:?}) validate: {e}")
+                        });
+                    }
+                    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: Vec::new(),
+                                views: &[View::RawUav(128)],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    let got = &out[0];
+                    let mut acc = 0.0f32;
+                    for (lane, &t) in terms.iter().enumerate() {
+                        let got_excl = f32::from_bits(got[lane * 2]);
+                        let got_incl = f32::from_bits(got[lane * 2 + 1]);
+                        let exp_excl = acc;
+                        acc += t;
+                        let exp_incl = acc;
+                        assert_eq!(
+                            got_excl.to_bits(),
+                            exp_excl.to_bits(),
+                            "wave64 ({mode:?}, warp={warp_idx}) lane {lane} excl: got {got_excl}, expected {exp_excl}"
+                        );
+                        assert_eq!(
+                            got_incl.to_bits(),
+                            exp_incl.to_bits(),
+                            "wave64 ({mode:?}, warp={warp_idx}) lane {lane} incl: got {got_incl}, expected {exp_incl}"
+                        );
+                    }
+                }
+            }
+        });
+    }
 }
