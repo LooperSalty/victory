@@ -202,6 +202,20 @@ pub(crate) fn read_back(
     }
 }
 
+/// Channel order of an 8-bit color readback. Typeless textures in these
+/// families have the same byte layout as their typed views.
+fn frame_bgra(format: DXGI_FORMAT) -> Option<bool> {
+    match format {
+        DXGI_FORMAT_R8G8B8A8_TYPELESS
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Some(false),
+        DXGI_FORMAT_B8G8R8A8_TYPELESS
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some(true),
+        _ => None,
+    }
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,
@@ -209,13 +223,9 @@ pub(crate) fn save_read_back(
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
     let f = footprint.Footprint;
-    let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
-        other => {
-            tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
-            return;
-        }
+    let Some(bgra) = frame_bgra(f.Format) else {
+        tracing::warn!(format = f.Format.0, "frame not saved: not 8-bit color");
+        return;
     };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
@@ -637,6 +647,15 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn typeless_frame_readbacks_keep_their_channel_order() {
+        assert_eq!(frame_bgra(DXGI_FORMAT_R8G8B8A8_TYPELESS), Some(false));
+        assert_eq!(frame_bgra(DXGI_FORMAT_B8G8R8A8_TYPELESS), Some(true));
+        assert_eq!(frame_bgra(DXGI_FORMAT_R16G16B16A16_FLOAT), None);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
