@@ -2244,6 +2244,67 @@ pub(crate) mod tests {
         );
     }
 
+    /// [`CODE_TABLE_FIRST_LANE`] with its index joined across a lane
+    /// condition: v5 = 0 in every lane, then 3 in lanes 10 and up, EXEC
+    /// restored. Both values are uniform, the joined index is not: lane 0
+    /// reads entry 0, lane 10 entry 3, and the console's `s_load` takes the
+    /// first lane's. `branch` skips the write with `s_cbranch_execz`;
+    /// without it EXEC alone guards it. Assembled with llvm-mc for gfx1030,
+    /// wave32.
+    fn code_table_joined_index(branch: bool) -> Vec<u32> {
+        let mut words = vec![
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7D82_0089, // v_cmp_lt_u32 vcc_lo, 9, v0
+            0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+        ];
+        if branch {
+            words.push(0xBF88_0001); // s_cbranch_execz 1
+        }
+        words.extend([
+            0x7E0A_0283, // v_mov_b32 v5, 3
+            0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+            0x3402_0A82, // v_lshlrev_b32 v1, 2, v5
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    #[test]
+    fn a_code_table_index_joined_across_a_lane_condition_is_refused_by_name() {
+        let mut wrong = Vec::new();
+        for branch in [true, false] {
+            let words = code_table_joined_index(branch);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let refused = ShaderError::Unsupported {
+                // the s_load_dword
+                offset: 4 * (words.len() - 3),
+                what: "an address read from the first lane of a per-lane value",
+            };
+            match track(&p, &[], HwStage::Cs, lanes(&p).as_ref()) {
+                Err(e) if e == refused => {}
+                Err(e) => wrong.push(format!("branch {branch}: {e}")),
+                Ok(r) => wrong.push(format!(
+                    "branch {branch}: traced as every lane's address: {:?}",
+                    r.scalar.iter().find(|s| s.1.param == CODE)
+                )),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// A waterfall loop over an image descriptor each lane loads from the
     /// table at s0 (wave32, assembled with llvm-mc for gfx1030): lane i
     /// reads entry i with two `global_load_dwordx4`, the loop reads the
