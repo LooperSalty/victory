@@ -240,10 +240,17 @@ macro_rules! once {
     }};
 }
 
-/// Makes slot `index` of a table view of `shadow` (the title buffer's host
-/// copy from its address to the end), or a null view without one. A root
-/// SRV needs 16-byte alignment, a root UAV 4; otherwise the view reads
-/// zeros, as the root view it replaces would have been refused.
+/// Whether a raw buffer view (SRV or UAV) has a valid D3D12 start offset
+/// (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT` = 16 bytes) and covers at least one
+/// whole 4-byte element.
+pub(crate) fn raw_view_valid(offset: u64, len: u64) -> bool {
+    offset.is_multiple_of(16) && len >= 4
+}
+
+/// Makes slot `index` a bounded raw SRV or UAV of `shadow` (or of `address`'s
+/// GPU-only range when the title reserved memory with no buffer) or a null
+/// view. Both raw SRVs and raw UAVs need 16-byte alignment and at least one
+/// 4-byte element; otherwise the view reads zeros and drops writes.
 fn bind_table_view(
     host: &crate::descriptor::host::HostHeap,
     index: u32,
@@ -273,14 +280,15 @@ fn bind_table_view(
         }
         (None, _) => return null(host),
     };
-    let align = if uav { 4 } else { 16 };
-    if !offset.is_multiple_of(align) {
-        // Raw views start on whole elements; one from the aligned start
-        // would shift every access.
+    if !raw_view_valid(offset, len) {
+        // Raw views start on 16-byte boundaries (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`)
+        // and cover at least one 4-byte element.
         once!(
             address = format_args!("{a:#x}"),
+            offset,
+            len,
             uav,
-            "a root view not on its element size reads zeros"
+            "a root view not on a raw 16-byte boundary or shorter than a dword reads zeros"
         );
         return null(host);
     }
@@ -779,6 +787,10 @@ impl State {
                     if kind == RootView::Uav && crate::pipeline::host::bounded_root_uavs() {
                         // A one-view table too (#493 for SRVs): a root UAV has
                         // no size, so a store past the copy faulted the GPU.
+                        if address.is_none() {
+                            once!(slot, "a shader uses a root UAV the title did not set");
+                        }
+                        let address = address.filter(|&a| a != 0);
                         if !self.root_view_table(list, address, param, compute, true) {
                             return false;
                         }
@@ -2251,5 +2263,17 @@ mod tests {
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
+    }
+
+    #[test]
+    fn raw_root_views_require_16_byte_alignment_and_at_least_one_dword() {
+        assert!(raw_view_valid(0, 4));
+        assert!(raw_view_valid(16, 4));
+        assert!(raw_view_valid(64, 4096));
+        assert!(!raw_view_valid(4, 64));
+        assert!(!raw_view_valid(8, 64));
+        assert!(!raw_view_valid(12, 64));
+        assert!(!raw_view_valid(16, 3));
+        assert!(!raw_view_valid(0, 0));
     }
 }

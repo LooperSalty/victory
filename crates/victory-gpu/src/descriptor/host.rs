@@ -444,8 +444,11 @@ impl HostHeap {
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        if len < 4 || !offset.is_multiple_of(16) {
+            self.null_raw_at(index);
+            return;
+        }
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -453,7 +456,7 @@ impl HostHeap {
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
                     FirstElement: offset / 4,
-                    NumElements: elements,
+                    NumElements: raw_elements(len),
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -474,10 +477,24 @@ impl HostHeap {
     }
 
     /// Makes slot `index` a raw unordered access view of `buffer` from
-    /// `offset` to the end of `len` bytes. A root UAV is a raw address with
-    /// no size, so a store past the buffer's copy faults the GPU; in a view
-    /// the hardware drops such stores instead.
+    /// `offset` (a multiple of 16) to the end of `len` bytes. A root UAV is
+    /// a raw address with no size, so a store past the buffer's copy faults
+    /// the GPU; in a view the hardware drops such stores instead.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        if len < 4 || !offset.is_multiple_of(16) {
+            self.null_raw_uav_at(index);
+            return;
+        }
+        // SAFETY: a live buffer.
+        let flags = unsafe { buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("bounded root UAV on a buffer whose host copy shaders cannot write")
+            });
+            self.null_raw_uav_at(index);
+            return;
+        }
         let Some(host) = host() else { return };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -508,11 +525,7 @@ impl HostHeap {
     /// reads zeros.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
         let Some(host) = host() else { return };
-        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
-        };
+        let desc = null_raw_uav_desc();
         // SAFETY: a slot of our heap; a null resource is allowed with a desc.
         unsafe {
             host.device.CreateUnorderedAccessView(
@@ -1287,6 +1300,22 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// A null raw buffer UAV description (`DXGI_FORMAT_R32_TYPELESS` requires
+/// `D3D12_BUFFER_UAV_FLAG_RAW`, mirroring [`null_buffer_view`]).
+fn null_raw_uav_desc() -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    }
+}
+
 /// The 4-byte elements of a raw buffer view of `len` bytes: whole elements
 /// only, at least one, at most `u32::MAX`.
 pub(crate) fn raw_elements(len: u64) -> u32 {
@@ -1587,5 +1616,119 @@ void main(uint3 id : SV_DispatchThreadID) {
             (&title[..68], &title[100..]),
             (&before[..68], &before[100..])
         );
+    }
+
+    #[test]
+    fn null_raw_uav_desc_sets_raw_flag_and_one_element() {
+        let desc = null_raw_uav_desc();
+        assert_eq!(desc.Format, DXGI_FORMAT_R32_TYPELESS);
+        assert_eq!(desc.ViewDimension, D3D12_UAV_DIMENSION_BUFFER);
+        // SAFETY: `ViewDimension` is `D3D12_UAV_DIMENSION_BUFFER`.
+        let buf = unsafe { desc.Anonymous.Buffer };
+        assert_eq!(buf.NumElements, 1);
+        assert_eq!(buf.Flags, D3D12_BUFFER_UAV_FLAG_RAW);
+    }
+
+    /// Bounded (`raw_uav_at`) and null (`null_raw_uav_at`) raw UAVs work on
+    /// the real D3D12 device: null reads zero and drops writes, while a
+    /// bounded raw UAV writes inside its 16-byte window and drops OOB stores.
+    #[test]
+    fn bounded_and_null_raw_uavs_run_on_gpu() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors = 3))"
+RWByteAddressBuffer null_uav : register(u0);
+RWByteAddressBuffer bounded_uav : register(u1);
+RWByteAddressBuffer seen : register(u2);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint from_null = null_uav.Load(0);
+    null_uav.Store(0, 0xDEADBEEFu);
+    seen.Store(0, from_null ^ 0x5A5A5A5Au);
+    bounded_uav.Store(0, 0x11112222u);
+    bounded_uav.Store(16, 0xBAD00000u);
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: source and entry point live through the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("bounded_uav"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        let device = &host.device;
+        // SAFETY: compiled DXBC with embedded root signature.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let heap = HostHeap::new(false, 4).unwrap();
+        let (target_buf, target_ptr) = host.shared_buffer(64).unwrap();
+        let (seen_buf, seen_ptr) = host.shared_buffer(16).unwrap();
+        // SAFETY: zeroing our own freshly mapped buffers before GPU use.
+        unsafe {
+            target_ptr.write_bytes(0, 64);
+            seen_ptr.write_bytes(0, 16);
+        }
+        heap.null_raw_uav_at(0);
+        heap.raw_uav_at(1, &target_buf, 16, 16);
+        heap.raw_uav_at(2, &seen_buf, 0, 16);
+
+        let list = host.new_list().unwrap();
+        // SAFETY: open list with our live heap, root signature, and PSO.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap.gpu_handle(0));
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU finished; reading back our mapped output buffer.
+        let seen_val = unsafe { seen_ptr.cast::<u32>().read() };
+        // SAFETY: GPU finished; reading back our mapped 64-byte target buffer.
+        let target_words = unsafe { std::slice::from_raw_parts(target_ptr.cast::<u32>(), 16) };
+        assert_eq!(seen_val, 0x5A5A_5A5A, "null raw UAV must read zero");
+        assert_eq!(target_words[4], 0x1111_2222, "in-bounds write must land at offset 16");
+        assert_eq!(target_words[8], 0, "OOB write past bounded raw UAV must be dropped");
+        assert_eq!(&target_words[..4], &[0; 4]);
+        assert_eq!(&target_words[5..], &[0; 11]);
+        // SAFETY: plain device query.
+        assert!(unsafe { device.GetDeviceRemovedReason() }.is_ok());
     }
 }
