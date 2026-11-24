@@ -11,6 +11,7 @@
 
 use super::{MAX_ROUNDS, Tracer};
 use crate::ir::{EXEC, Exit, Inst, Reg, VCC, Value, reverse_postorder};
+use crate::structure::{Atom, Bool};
 
 /// Operations that combine lane masks bit by bit (or copy one).
 const MASK_OPS: &[&str] = &[
@@ -78,7 +79,13 @@ impl Tracer<'_> {
             for (b, block) in self.p.blocks.iter().enumerate() {
                 for phi in &block.phis {
                     let i = phi.value.0 as usize;
-                    if ok[i] && (tainted[b] || !phi.args.iter().all(|&a| self.uniform(a))) {
+                    // Lanes outside EXEC reach a join by the edge the
+                    // wave took, with their old value.
+                    let entered = self.block_uniform(b)
+                        && self.p.blocks[b].preds.iter().all(|&q| self.block_uniform(q));
+                    if ok[i]
+                        && (tainted[b] || !entered || !phi.args.iter().all(|&a| self.uniform(a)))
+                    {
                         ok[i] = false;
                         changed = true;
                     }
@@ -146,13 +153,34 @@ impl Tracer<'_> {
         })
     }
 
-    /// Whether lanes run the instruction defining `v` under a condition
-    /// beyond reaching it.
-    pub(super) fn guarded(&self, v: Value) -> bool {
+    /// Whether every lane of the wave runs the instruction defining `v`,
+    /// or none: its block's entry condition and its guard are the same in
+    /// every lane.
+    pub(super) fn runs_in_every_lane(&self, v: Value) -> bool {
         match (self.lanes, self.defs[v.0 as usize]) {
-            (Some(st), Some((b, i))) => st.guards[b][i].is_some(),
-            _ => true,
+            (Some(st), Some((b, i))) => {
+                self.block_uniform(b) && st.guards[b][i].is_none_or(|g| self.bool_uniform(g))
+            }
+            _ => false,
         }
+    }
+
+    /// Whether every lane of the wave enters block `b`, or none (EXEC
+    /// narrowed before a branch lets lanes skip a block the branch enters).
+    fn block_uniform(&self, b: usize) -> bool {
+        self.lanes.is_some_and(|st| self.bool_uniform(st.reach[b]))
+    }
+
+    /// Whether `c` holds in every lane or in none.
+    fn bool_uniform(&self, c: Bool) -> bool {
+        let Some(st) = self.lanes else {
+            return false;
+        };
+        st.bools.support(c).iter().all(|a| match *a {
+            Atom::Uniform(x) => self.uniform(x),
+            Atom::Lane(x) => self.mask_uniform(x),
+            _ => false,
+        })
     }
 
     /// The blocks tainted by the branch closing each block, were it divergent.

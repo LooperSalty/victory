@@ -1113,10 +1113,17 @@ impl<'a> Tracer<'a> {
             _ => true,
         };
         match &inst.fields {
-            Fields::Sop { src, .. } => src.iter().all(uniform_op),
+            // (SCC, which `s_cselect` and the carries read, is no operand.)
+            Fields::Sop { src, .. } => {
+                src.iter().all(uniform_op)
+                    && inst.read(Reg::Scc).is_none_or(|c| self.uniform(c))
+            }
+            // A write that only some lanes run leaves the others their old
+            // value: the same as the new one only by chance.
             Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
                 f.src.iter().all(uniform_op)
-                    && self.valu_reads_uniform(inst, self.guarded(v))
+                    && self.runs_in_every_lane(v)
+                    && self.valu_reads_uniform(inst, false)
             }
             _ => false,
         }
