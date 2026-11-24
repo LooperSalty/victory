@@ -1113,17 +1113,16 @@ impl<'a> Tracer<'a> {
             _ => true,
         };
         match &inst.fields {
-            // (SCC, which `s_cselect` and the carries read, is no operand.)
+            // Scalar selects and carry operations also read SCC implicitly.
             Fields::Sop { src, .. } => {
-                src.iter().all(uniform_op)
-                    && inst.read(Reg::Scc).is_none_or(|c| self.uniform(c))
+                src.iter().all(uniform_op) && inst.read(Reg::Scc).is_none_or(|c| self.uniform(c))
             }
             // A write that only some lanes run leaves the others their old
             // value: the same as the new one only by chance.
             Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
                 f.src.iter().all(uniform_op)
                     && self.runs_in_every_lane(v)
-                    && self.valu_reads_uniform(inst, false)
+                    && self.valu_reads_uniform(inst)
             }
             _ => false,
         }

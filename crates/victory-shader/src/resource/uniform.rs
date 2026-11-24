@@ -77,12 +77,14 @@ impl Tracer<'_> {
             }
             let mut changed = false;
             for (b, block) in self.p.blocks.iter().enumerate() {
+                if block.phis.is_empty() {
+                    continue;
+                }
+                // Inactive lanes retain their old values along the wave's chosen edge.
+                let entered =
+                    self.block_uniform(b) && block.preds.iter().all(|&q| self.block_uniform(q));
                 for phi in &block.phis {
                     let i = phi.value.0 as usize;
-                    // Lanes outside EXEC reach a join by the edge the
-                    // wave took, with their old value.
-                    let entered = self.block_uniform(b)
-                        && self.p.blocks[b].preds.iter().all(|&q| self.block_uniform(q));
                     if ok[i]
                         && (tainted[b] || !entered || !phi.args.iter().all(|&a| self.uniform(a)))
                     {
@@ -134,7 +136,7 @@ impl Tracer<'_> {
         };
         let name = inst.name();
         if name.starts_with("v_cmp") && !name.starts_with("v_cmpx") {
-            return self.valu_reads_uniform(inst, false);
+            return self.valu_reads_uniform(inst);
         }
         MASK_OPS.contains(&name)
             && inst.reads.iter().all(|&(reg, x)| {
@@ -142,13 +144,12 @@ impl Tracer<'_> {
             })
     }
 
-    /// Whether every register a VALU instruction reads is uniform, but EXEC
-    /// and, unless `guarded`, the old value of the VGPRs it writes (which
-    /// only the lanes it skips keep).
-    pub(super) fn valu_reads_uniform(&self, inst: &Inst, guarded: bool) -> bool {
+    /// Check implicit VALU inputs, excluding EXEC and the preserved destination.
+    /// Callers check explicit sources and handle lane participation separately.
+    pub(super) fn valu_reads_uniform(&self, inst: &Inst) -> bool {
         inst.reads.iter().all(|&(reg, x)| {
             is_exec(reg)
-                || (!guarded && matches!(reg, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == reg))
+                || (matches!(reg, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == reg))
                 || self.uniform(x)
         })
     }
