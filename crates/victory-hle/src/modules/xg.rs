@@ -78,11 +78,121 @@ pub extern "system" fn XGSuggestSwizzleMode(
     // (either may be null).
     match unsafe { (desc.as_ref(), out.as_mut()) } {
         (Some(desc), Some(out)) => {
-            *out = SWIZZLED | suggested(desc).0;
+            #[cfg(windows)]
+            let native = native_suggest(desc, _flags);
+            #[cfg(not(windows))]
+            let native = None;
+            *out = select_suggestion(desc, native);
             S_OK
         }
         _ => E_INVALIDARG,
     }
+}
+
+fn select_suggestion(desc: &ResourceDesc, native: Option<Result<u32, HRESULT>>) -> u32 {
+    let fallback = SWIZZLED | suggested(desc).0;
+    match native {
+        Some(Ok(value)) => {
+            if value != fallback {
+                tracing::warn!(
+                    ?desc,
+                    native = format_args!("{value:#x}"),
+                    fallback = format_args!("{fallback:#x}"),
+                    "native XG swizzle differs"
+                );
+            }
+            value
+        }
+        Some(Err(hr)) => {
+            tracing::warn!(
+                hr = format_args!("{:#x}", hr as u32),
+                "native XG suggestion failed; using fallback"
+            );
+            fallback
+        }
+        None => fallback,
+    }
+}
+
+/// Optional experiment: call the user-supplied library only when explicitly configured.
+#[cfg(windows)]
+fn native_suggest(desc: &ResourceDesc, flags: u32) -> Option<Result<u32, HRESULT>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    type Suggest = unsafe extern "system" fn(*const ResourceDesc, u32, *mut u32) -> HRESULT;
+    static FUNCTION: OnceLock<Option<Suggest>> = OnceLock::new();
+    let function = FUNCTION.get_or_init(|| {
+        let path = std::env::var_os("ANYXBOXX_NATIVE_XG")?;
+        if !std::path::Path::new(&path).is_absolute() {
+            tracing::warn!(?path, "native XG library path must be absolute");
+            return None;
+        }
+        let wide: Vec<u16> = path.encode_wide().chain(Some(0)).collect();
+        // The library is kept loaded for the lifetime of the process.
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if module.is_null() {
+            tracing::warn!(?path, "could not load native XG library");
+            return None;
+        }
+        let Some(symbol) =
+            (unsafe { GetProcAddress(module, c"XGSuggestSwizzleMode".as_ptr().cast()) })
+        else {
+            tracing::warn!(?path, "native XG library lacks XGSuggestSwizzleMode");
+            return None;
+        };
+        tracing::info!(?path, "using native XG texture swizzle suggestions");
+        Some(unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, Suggest>(symbol)
+        })
+    });
+    let function = (*function)?;
+    let mut result = 0;
+    let hr = unsafe { function(desc, flags, &mut result) };
+    Some(if hr >= 0 { Ok(result) } else { Err(hr) })
+}
+
+/// Experimental native texture computer; opt in separately from swizzle suggestions.
+#[cfg(windows)]
+fn native_computer(desc: &ResourceDesc) -> Option<Result<*mut Computer, HRESULT>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    type Create = unsafe extern "system" fn(*const ResourceDesc, *mut *mut Computer) -> HRESULT;
+    static FUNCTION: OnceLock<Option<Create>> = OnceLock::new();
+    let function = FUNCTION.get_or_init(|| {
+        if std::env::var_os("ANYXBOXX_NATIVE_XG_COMPUTER").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return None;
+        }
+        let path = std::env::var_os("ANYXBOXX_NATIVE_XG")?;
+        if !std::path::Path::new(&path).is_absolute() {
+            return None;
+        }
+        let wide: Vec<u16> = path.encode_wide().chain(Some(0)).collect();
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if module.is_null() {
+            tracing::warn!(?path, "native XG computer library load failed");
+            return None;
+        }
+        let Some(symbol) =
+            (unsafe { GetProcAddress(module, c"XGCreateTextureComputer".as_ptr().cast()) })
+        else {
+            tracing::warn!(?path, "native XG computer export missing");
+            return None;
+        };
+        tracing::info!(?path, "using native XG texture computer");
+        Some(unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Create>(symbol) })
+    });
+    let function = (*function)?;
+    let mut out = std::ptr::null_mut();
+    let hr = unsafe { function(desc, &mut out) };
+    Some(if hr >= 0 && !out.is_null() {
+        Ok(out)
+    } else {
+        Err(if hr < 0 { hr } else { E_FAIL })
+    })
 }
 
 #[repr(C)]
@@ -109,6 +219,19 @@ pub extern "system" fn XGCreateTextureComputer(
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
     };
+    #[cfg(windows)]
+    if let Some(result) = native_computer(&desc) {
+        match result {
+            Ok(native) => {
+                unsafe { out.write(native) };
+                return S_OK;
+            }
+            Err(hr) => tracing::warn!(
+                hr = format_args!("{:#x}", hr as u32),
+                "native XG texture computer failed; using fallback"
+            ),
+        }
+    }
     let Some(texture) = texture(&desc) else {
         tracing::warn!(?desc, "no texture layout");
         return E_INVALIDARG;
@@ -582,19 +705,19 @@ struct Vtable([*const (); 13]);
 unsafe impl Sync for Vtable {}
 
 static VTABLE: Vtable = Vtable([
-    add_ref as *const (),   // 0x00
-    release as *const (),   // 0x08
-    layout as *const (),    // 0x10
-    unused as *const (),    // 0x18 size
-    unused as *const (),    // 0x20 alignment
-    unused as *const (),    // 0x28 mip offset
+    add_ref as *const (),        // 0x00
+    release as *const (),        // 0x08
+    layout as *const (),         // 0x10
+    unused as *const (),         // 0x18 size
+    unused as *const (),         // 0x20 alignment
+    unused as *const (),         // 0x28 mip offset
     element_offset as *const (), // 0x30
-    unused as *const (),    // 0x38 element coordinate
-    copy_into as *const (), // 0x40
-    copy_from as *const (), // 0x48
-    tiling as *const (),    // 0x50
-    unused as *const (),    // 0x58 view descriptor
-    unused as *const (),    // 0x60 tiled resource?
+    unused as *const (),         // 0x38 element coordinate
+    copy_into as *const (),      // 0x40
+    copy_from as *const (),      // 0x48
+    tiling as *const (),         // 0x50
+    unused as *const (),         // 0x58 view descriptor
+    unused as *const (),         // 0x60 tiled resource?
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -626,6 +749,14 @@ mod tests {
             layout,
             flags: 0,
         }
+    }
+
+    #[test]
+    fn native_suggestion_is_used_or_falls_back_on_error() {
+        let d = desc(256, 256, 1, 28, 0);
+        assert_eq!(select_suggestion(&d, None), 0x105);
+        assert_eq!(select_suggestion(&d, Some(Err(E_FAIL))), 0x105);
+        assert_eq!(select_suggestion(&d, Some(Ok(0x11b))), 0x11b);
     }
 
     /// Method `index` of a computer, as the title calls it.
