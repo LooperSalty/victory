@@ -457,6 +457,14 @@ pub(crate) fn is_skipped(this: This) -> bool {
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
+    note_drop_as(this, "");
+}
+
+/// As [`note_drop`], the reason after `prefix`: indirect executions count
+/// apart from the pipeline's direct draws and dispatches (they are counted
+/// in the frame line's indirect figure, not its dropped one).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_drop_as(this: This, prefix: &str) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
@@ -466,7 +474,7 @@ pub(crate) fn note_drop(this: This) {
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
-        note_why(why);
+        note_why(format!("{prefix}{why}"));
     }
 }
 

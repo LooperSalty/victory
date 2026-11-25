@@ -2278,26 +2278,35 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // Every drop here is noted as "indirect kind N: ..." (diagnostics),
+        // the pipeline's own reason included, so the reasons of indirect
+        // executions add up to the frame line's indirect figure and those
+        // of direct draws to its dropped figure.
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let why = |_: &str| {};
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
+            let prefix = format!("indirect kind {kind}: ");
+            crate::pipeline::note_drop_as(self.pipeline as This, &prefix);
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            why("a stage of the ray-tracing structure builder, which is off");
             return false;
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                let prefix = format!("indirect kind {kind}: ");
+                crate::pipeline::note_drop_as(self.pipeline as This, &prefix);
+            }
             return false;
         };
         // Indirect rectangles (Grand Theft Auto VI's tiled lighting, 256

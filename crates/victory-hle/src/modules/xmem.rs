@@ -459,11 +459,55 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
         return 0;
     }
     let mut physical = physical();
+    let mut unknown = 0;
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        if physical.pages.remove(&unsafe { *pages.add(i) }).is_none() {
+            unknown += 1;
+        }
     }
+    tracing::debug!(
+        n,
+        // SAFETY: as above.
+        first = format_args!("{:#x}", if n > 0 { unsafe { *pages } } else { 0 }),
+        unknown,
+        "XMemFreePhysicalPages"
+    );
     1
+}
+
+/// Why physical page `page` is not in the page table, for reports of
+/// writes that could not land: page numbers are handed out once, in order,
+/// so one of ours that is gone was freed.
+fn unknown_page(physical: &Physical, page: usize) -> &'static str {
+    if physical.pages.contains_key(&page) {
+        "known"
+    } else if (0x10_0000..physical.next_page).contains(&page) && page.is_multiple_of(FRAMES) {
+        "freed"
+    } else {
+        "never handed out"
+    }
+}
+
+/// For a write to `[offset, offset + len)` of `pages` that failed: the
+/// first page that is not in the page table and why, or that every page is
+/// known (so the host failed to map a view; that failure is logged).
+pub(crate) fn explain_unwritten(pages: &[usize], offset: usize, len: usize) -> String {
+    let Some(range) = offset
+        .checked_add(len)
+        .and_then(|end| pages.get(offset / PAGE..end.div_ceil(PAGE)))
+    else {
+        return "the page list ends early".to_owned();
+    };
+    let physical = physical();
+    match range.iter().find(|&&page| !physical.pages.contains_key(&page)) {
+        Some(&page) => format!(
+            "page {page:#x} {} (pages handed out below {:#x})",
+            unknown_page(&physical, page),
+            physical.next_page
+        ),
+        None => "every page known: the host failed to map one".to_owned(),
+    }
 }
 
 /// A view of our own on consecutive slices of one section, committed and
@@ -489,6 +533,12 @@ impl View {
             )
         };
         if at.Value.is_null() {
+            tracing::warn!(
+                offset,
+                len,
+                error = %std::io::Error::last_os_error(),
+                "a view of physical pages could not be mapped"
+            );
             return None;
         }
         let view = View { at, len };
@@ -1387,5 +1437,19 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn unwritten_destinations_name_the_page_and_why() {
+        let a = allocate(2);
+        assert!(explain_unwritten(&a, 0, 2 * PAGE).starts_with("every page known"));
+        assert!(explain_unwritten(&a, PAGE, 2 * PAGE).contains("ends early"));
+        let why = explain_unwritten(&[a[0], 0x10], 0, PAGE + 1);
+        assert!(why.contains("0x10 never handed out"), "{why}");
+        assert_eq!(XMemFreePhysicalPages(1, &a[1]), 1);
+        let why = explain_unwritten(&a, 0, PAGE + 1);
+        assert!(why.contains(&format!("{:#x} freed", a[1])), "{why}");
+        assert!(!write_physical(&a, 0, &[0; PAGE + 1]), "a freed page takes no write");
+        assert_eq!(XMemFreePhysicalPages(1, a.as_ptr()), 1);
     }
 }
