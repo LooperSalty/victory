@@ -450,3 +450,218 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// Two console waves of 64 threads in a group of 128. Thread t holds the 16-bit float with
+/// bits 0x3C00 + 37 t under the high half 0x5A5A, and leaves by one of two early-outs
+/// (`if (t >= s0) return; if ((t & s1) != s2) return;`); the threads left store their
+/// wave's sum to the wave's dword of the raw UAV.
+/// `stored`: a store inside the whole-wave section, before EXEC is put back.
+/// `or`: the wave's OR of the terms instead of their sum.
+fn sum_behind_early_outs(stored: bool, or: bool) -> NativeProgram {
+    let mut words = vec![
+        0x340C_0085, // v_lshlrev_b32 v6, 5, v0
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0x4A0E_0F06, // v_add_nc_u32 v7, v6, v7
+        0x4A0E_0F00, // v_add_nc_u32 v7, v0, v7
+        0x4A0E_0EFF,
+        0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
+        0x380E_0EFF,
+        0x5A5A_0000, // v_or_b32 v7, 0x5a5a0000, v7
+        0x2C10_0086, // v_lshrrev_b32 v8, 6, v0
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8
+        0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0
+        0xBF88_0000 | (26 + u32::from(stored) * 2), // s_cbranch_execz to the end
+        0x3612_0001, // v_and_b32 v9, s1, v0
+        0x7DA4_1202, // v_cmpx_eq_u32 exec, s2, v9
+        0xBF88_0000 | (23 + u32::from(stored) * 2), // s_cbranch_execz to the end
+    ];
+    // (the wave OR's words with v_add_f16 for v_or_b32: opcode 50 for 28)
+    let section: Vec<u32> = super::wave::WAVE_OR_V7_TO_S7
+        .iter()
+        .map(|&w| if w >> 25 == 28 && !or { w & 0x01FF_FFFF | 50 << 25 } else { w })
+        .collect();
+    let (inside, restore) = section.split_at(section.len() - 1);
+    words.extend_from_slice(inside);
+    if stored {
+        words.extend_from_slice(&[0xE070_1000, 0x8002_0108]); // buffer_store_dword v1, v8, s[8:11], 0 offen
+    }
+    words.extend_from_slice(restore); // s_mov_b64 exec, s[4:5]
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0xE070_1000,
+        0x8002_0008, // buffer_store_dword v0, v8, s[8:11], 0 offen
+    ]);
+    native_of(&words, true, 128)
+}
+
+/// The console's `v_add_f16` of two halves that are zero or normal numbers, with a zero or
+/// normal sum: added exactly (in f64) and rounded to 16 bits, to nearest, ties to even.
+fn add_f16(a: u16, b: u16) -> u16 {
+    let wide = |h: u16| {
+        let e = i32::from(h >> 10 & 31);
+        if h & 0x7FFF == 0 {
+            return 0.0;
+        }
+        assert!(e != 0 && e != 31, "{h:#x} is no normal half");
+        let mag = f64::from(0x400 | h & 0x3FF) * 2f64.powi(e - 25);
+        if h >> 15 == 1 { -mag } else { mag }
+    };
+    let s = wide(a) + wide(b);
+    if s == 0.0 {
+        return 0;
+    }
+    let e = s.abs().log2().floor() as i32;
+    assert!((-14..=15).contains(&e), "{s} is no normal half");
+    // the leading one with the 10 bits below it, and what is left under them
+    let scaled = s.abs() / 2f64.powi(e - 10);
+    let mut m = scaled.floor() as u32;
+    let rest = scaled - f64::from(m);
+    if rest > 0.5 || rest == 0.5 && m & 1 == 1 {
+        m += 1;
+    }
+    // (a mantissa rounded up to 2048 carries into the exponent by this addition)
+    let h = (((e + 15) as u32) << 10) + (m - 0x400);
+    assert!(h < 0x7C00, "{s} overflows a half");
+    h as u16 | if s < 0.0 { 0x8000 } else { 0 }
+}
+
+#[test]
+fn the_reference_addition_of_halves_rounds_to_nearest_even() {
+    assert_eq!(add_f16(0x3C03, 0x4000), 0x4202); // (`a_16_bit_sum_rounds_to_nearest_when_asked_to`)
+    assert_eq!(add_f16(0x3C00, 0), 0x3C00);
+    assert_eq!(add_f16(0, 0), 0);
+    assert_eq!(add_f16(0x3C00, 0x3C00), 0x4000);
+    assert_eq!(add_f16(0x3C00, 0xBC00), 0);
+    assert_eq!(add_f16(0x3FFF, 0x3C01), 0x4200); // 1.9990234375 + 1.0009765625 = 3
+    assert_eq!(add_f16(0x3C01, 0x4000), 0x4200); // 3 and half a step: a tie, down to the even 3
+    assert_eq!(add_f16(0x4001, 0x3C00), 0x4201); // 3 and one step: exact
+    assert_eq!(add_f16(0x43FF, 0x3C00), 0x4500); // 3.998046875 + 1: a tie, up to the even 5
+}
+
+/// `WaveActiveSum` of 16-bit floats after early-outs, as in
+/// `compute_graph_ops:CS_TransposeVecMatMulAlignedOperation` (its four sums stand behind
+/// the tests of the vector's and the matrix's bounds): the lanes that left add +0 at their
+/// places in the console's tree. Two host waves of 32 can only add their halves where every
+/// thread of the group comes by, so the program is taken without its early-outs
+/// ([`ir::without_early_outs`]): the lanes that left walk on with EXEC clear, through the
+/// whole-wave section too.
+#[test]
+fn a_sum_of_halves_behind_early_outs_adds_zero_for_the_lanes_that_left() {
+    let native = sum_behind_early_outs(false, false);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let count = |p: &ir::Program, name: &str| p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == name).count();
+    assert_eq!((count(&p, "v_add_f16"), count(&p, "s_cbranch_execz")), (6, 2));
+    // as it stands, the two host waves cannot meet behind the early-outs
+    let as_is = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(&as_is, Err(ShaderError::Unsupported { what, .. }) if *what == "a wave sum of 16-bit floats where not every lane runs"),
+        "{:?}",
+        as_is.err()
+    );
+    // without them every lane runs the sum
+    let walked = ir::without_early_outs(&p).expect("the early-outs are left out");
+    assert_eq!((count(&walked, "v_add_f16"), count(&walked, "s_cbranch_execz")), (6, 0));
+    let shader = lowered(&native, &walked, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // (below, mask, equal): thread t stays if t < below and t & mask == equal
+    let cases: [[u32; 3]; 14] = [
+        [128, 0, 0],       // every lane of both waves
+        [100, 0, 0],       // the second wave's lanes 36 and up have left
+        [97, 0, 0],        // ... all of its upper half but lane 32
+        [96, 0, 0],        // ... its upper half
+        [70, 0, 0],        // ... all but six lanes
+        [64, 0, 0],        // the second wave has left
+        [33, 0, 0],        // one lane of the first wave's upper half is left
+        [32, 0, 0],        // none of it
+        [5, 0, 0],         // five lanes
+        [1, 0, 0],         // lane 0 alone
+        [128, 1, 1],       // the odd lanes: lane 0 has left
+        [128, 0x21, 0],    // the even lanes of the lower halves
+        [128, 0x3C, 0x24], // lanes 36 to 39: no lane of the lower halves
+        [0, 0, 0],         // no one
+    ];
+    let term = |t: u32| 0x5A5A_0000 | (0x3C00 + 37 * t);
+    let stays = |t: u32, [below, mask, equal]: [u32; 3]| t < below && t & mask == equal;
+    // what a wave stores, and its sum added lane after lane instead
+    let console = |case: [u32; 3], wave: u32| -> (u32, u16) {
+        let lanes: Vec<u32> = (wave * 64..wave * 64 + 64).map(|t| if stays(t, case) { term(t) } else { 0 }).collect();
+        if lanes.iter().all(|&x| x == 0) {
+            return (0, 0); // (no lane is left to store)
+        }
+        let mut tree: Vec<u16> = lanes.iter().map(|&x| x as u16).collect();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| add_f16(c[0], c[1])).collect();
+        }
+        let in_a_row = lanes.iter().map(|&x| x as u16).reduce(add_f16).unwrap();
+        // (the high half is lane 0's term's: zero if lane 0 has left)
+        (lanes[0] & 0xFFFF_0000 | u32::from(tree[0]), in_a_row)
+    };
+    // these terms tell the tree from another order, also with lanes that left
+    for (case, wave) in [(0, 0), (1, 1), (4, 1), (11, 0), (11, 1)] {
+        let (tree, in_a_row) = console(cases[case], wave);
+        assert_ne!(tree as u16, in_a_row, "case {case}, wave {wave}");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; not run");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the {label} device does not take this program (waves of 32?): {e}; not run");
+                continue;
+            }
+        };
+        for case in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, d @ 0..=2) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = case[d as usize];
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(2)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for wave in 0..2 {
+                let (want, in_a_row) = console(case, wave);
+                let got = out[0][wave as usize];
+                assert_eq!(got, want, "{label}: {case:?}, wave {wave}: {got:#x}, the console's tree {want:#x} (in a row {in_a_row:#x})");
+            }
+        }
+        eprintln!("ran on the {label} device: the console's tree with +0 for the lanes that left, in {} cases", cases.len());
+    }
+}
+
+/// A whole-wave section that stores is not for the lanes that left to walk: on the console
+/// they run it only while some lane of their wave is left, so the early-outs stay.
+#[test]
+fn an_early_out_before_a_whole_wave_section_that_stores_stays() {
+    let native = sum_behind_early_outs(true, false);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert_eq!(p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name().starts_with("buffer_store")).count(), 2);
+    assert!(ir::without_early_outs(&p).is_none());
+    // (and without that store they go)
+    let native = sum_behind_early_outs(false, false);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert!(ir::without_early_outs(&p).is_some());
+    // Another reduction's section is left as it was for now (those programs have other
+    // forms, which this one would come before).
+    let native = sum_behind_early_outs(false, true);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert!(p.blocks.iter().flat_map(|b| &b.insts).all(|i| i.name() != "v_add_f16"));
+    assert!(ir::without_early_outs(&p).is_none());
+}

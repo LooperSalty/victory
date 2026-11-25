@@ -605,6 +605,48 @@ fn skipped_region(p: &Program, branch: usize, first: usize, target: usize) -> Op
     Some((region, seen))
 }
 
+/// Whether `insts[start]` opens a whole-wave section (`s_or_saveexec -1` or
+/// `s_nand_saveexec 0`: how the compiler expands an HLSL wave reduction, see
+/// `emit::wave`) that only computes: nothing but vector arithmetic and lane reads up to
+/// the `s_mov` that puts the saved mask back, no other write of EXEC, nothing stored.
+/// The lanes that are there with EXEC clear run it as the console's inactive lanes do
+/// (their terms are the identity, by the saved mask), and what it leaves in them (its
+/// temporaries, the result) no one sees whose EXEC stays clear.
+///
+/// Only for a sum of 16-bit floats (`v_add_f16` steps): rounded at every step, it is the
+/// one reduction two host waves of 32 cannot take in any other form than its tree with
+/// every lane there (`emit::lower`, `half_sum`).
+// shortcut: the sections of the other reductions qualify as well, but walking them moves
+// 30 of the title's compute programs that translate today to this form (group barriers
+// where they had none), untried in a game run.
+fn whole_wave_arithmetic(insts: &[Inst], start: usize) -> bool {
+    let inst = &insts[start];
+    let all = match inst.name() {
+        "s_or_saveexec_b64" | "s_or_saveexec_b32" => Operand::Const(193),
+        "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Operand::Const(128),
+        _ => return false,
+    };
+    let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), src, .. } = &inst.fields else { return false };
+    if src.first() != Some(&all) {
+        return false;
+    }
+    let Some(saved) = inst.write(Reg::S(*code)) else { return false };
+    let exec = |i: &Inst| i.writes.iter().any(|(reg, _)| matches!(reg, Reg::S(126 | 127)));
+    let mut halves = false;
+    for inst in &insts[start + 1..] {
+        if exec(inst) {
+            return halves
+                && matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+                && inst.read(Reg::S(*code)) == Some(saved);
+        }
+        if !matches!(inst.fields, Fields::Valu(_)) {
+            return false;
+        }
+        halves |= inst.name() == "v_add_f16";
+    }
+    false
+}
+
 /// A scalar restore can re-enable lanes even when the region was entered
 /// with empty EXEC. A subsequent vector store would then be observable.
 fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
@@ -628,12 +670,18 @@ fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
         }
     }
     for &b in region {
-        for inst in &p.blocks[b].insts {
+        let insts = &p.blocks[b].insts;
+        for (i, inst) in insts.iter().enumerate() {
             let name = inst.name();
             if !inst.writes.iter().any(|(reg, _)| matches!(reg, Reg::S(126 | 127))) {
                 continue;
             }
             if name.starts_with("v_cmpx_") || matches!(name, "s_and_saveexec_b32" | "s_and_saveexec_b64") {
+                continue;
+            }
+            // A whole-wave section sets every lane's EXEC bit, but for the wave's own
+            // arithmetic alone, and puts the saved (empty) mask back.
+            if whole_wave_arithmetic(insts, i) {
                 continue;
             }
             let Fields::Sop { src, .. } = &inst.fields else { return false };
@@ -663,7 +711,9 @@ fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
 /// walk the body with EXEC clear. The region must keep EXEC clear, so a
-/// scalar restore there cannot activate vector operations for those lanes. The
+/// scalar restore there cannot activate vector operations for those lanes
+/// (a whole-wave section that only computes aside, [`whole_wave_arithmetic`]:
+/// a wave reduction after the early-out is then in code every lane runs). The
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses.
 /// `None` if the program has no such branch.
