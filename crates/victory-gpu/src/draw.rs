@@ -1508,10 +1508,36 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        // `VICTORY_HEAP_TEXTURES_MS` sets the time (250 by default): the
+        // pass used all of it in every frame of the opening cutscene
+        // (about 200 textures a pass at some 1 ms each, the host view and
+        // the upload), 2.6-2.8 frames a second on an RTX 5080; with 60 it
+        // was 4.7, and the slots waiting were no more.
+        static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let span = *SPAN.get_or_init(|| {
+            let ms = std::env::var("VICTORY_HEAP_TEXTURES_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(250);
+            std::time::Duration::from_millis(ms)
+        });
+        // `VICTORY_HEAP_TEXTURES_GROWTH`: a texture streaming in is uploaded
+        // again only once this many times the bytes of its last upload are
+        // mapped, or all of it (1 by default: at any more). Every upload
+        // is of the whole texture, and a third of the pass's uploads were
+        // of textures not all mapped; with 2 (and 60 ms) the cutscene ran
+        // at 5.4 frames a second.
+        static GROWTH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let growth = *GROWTH.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_TEXTURES_GROWTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+                .max(1)
+        });
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -1538,7 +1564,8 @@ impl State {
                     continue;
                 }
                 if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
+                    let had = host.texture_slot_mapped(index);
+                    if mapped <= had || (had != 0 && mapped < had.saturating_mul(growth)) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
