@@ -177,15 +177,7 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
-    let lanes = emit::host_wave_max();
-    println!(
-        "host waves   up to {lanes} lanes{}",
-        if lanes < 64 {
-            " (console wave64 compute in 32-lane waves, split last)"
-        } else {
-            ""
-        }
-    );
+    print_host_waves();
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -315,6 +307,19 @@ pub fn run(
     Ok(())
 }
 
+/// The widest wave translations target ([`emit::host_wave_max`]).
+fn print_host_waves() {
+    let lanes = emit::host_wave_max();
+    println!(
+        "host waves   up to {lanes} lanes{}",
+        if lanes < 64 {
+            " (console wave64 compute in 32-lane waves, split last)"
+        } else {
+            ""
+        }
+    );
+}
+
 /// The warm-up (`--cache`): every distinct container found goes through
 /// the shader cache `run` reads (`<cache>/shaders`, decision 0003), by the
 /// same code, so a run finds it translated or refused. With `pipelines`,
@@ -336,6 +341,9 @@ pub fn warm(
     let paths = crate::default_paths(paths)?;
     let dir = victory_core::Config::load()?.cache_subdir("shaders")?;
     anyhow::ensure!(victory_gpu::shader_cache::prepare_host(), "no host D3D12 device");
+    // (the device's widest wave, which the translations and each cache entry's key depend
+    // on, is known from here on, as in a run)
+    print_host_waves();
     anyhow::ensure!(
         victory_gpu::shader_cache::use_shader_cache(dir.clone()),
         "no shader cache in {}",
