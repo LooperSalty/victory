@@ -1682,3 +1682,38 @@ fn mimg_cube_sample_d_selects_exact_log2_mip() {
         }
     }
 }
+
+const DS_ADD_U32: u8 = 0x00;
+const DS_SUB_U32: u8 = 0x01;
+const DS_SUB_RTN_U32: u8 = 0x21;
+
+/// 64 threads (two host waves of 32 or one of 64): LDS[0] = v1, then every
+/// thread applies `op` with the register v3; v0 = LDS[0].
+fn lds_atomic_over_64_threads(name: &str, op: u8, want: u32) {
+    let mut body = vec![vop1(0x001, 5, 0x80)];
+    body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    body.push(S_BARRIER);
+    // The `_rtn` form returns the old value into v6, unused here.
+    body.extend(ds(op, 6, 5, 3));
+    body.push(S_BARRIER);
+    body.extend(ds(DS_READ_B32, 0, 5, 0));
+    let shader = build_cs(&body, 64, 512);
+    run_cases(&shader, &[[1000, 0, 7, 0]], |backend, _, _, got| {
+        assert_eq!(got, want, "{backend}: {name} of 7 from 1000 over 64 threads");
+    });
+}
+
+#[test]
+fn ds_add_u32_of_a_register_is_atomic_across_waves() {
+    lds_atomic_over_64_threads("ds_add_u32", DS_ADD_U32, 1000 + 64 * 7);
+}
+
+#[test]
+fn ds_sub_u32_of_a_register_is_atomic_across_waves() {
+    lds_atomic_over_64_threads("ds_sub_u32", DS_SUB_U32, 1000 - 64 * 7);
+}
+
+#[test]
+fn ds_sub_rtn_u32_of_a_register_is_atomic_across_waves() {
+    lds_atomic_over_64_threads("ds_sub_rtn_u32", DS_SUB_RTN_U32, 1000 - 64 * 7);
+}

@@ -4485,6 +4485,25 @@ impl<'a> Lower<'a> {
         }
         let at = self.begin_guarded(guard);
         let r = match rmw {
+            // NVIDIA's RTX 50 drivers (621.01 here, 617.14 to 621.24 in xcl's
+            // reports) refuse a compute pipeline with `atomicrmw sub` on
+            // group-shared memory (E_OUTOFMEMORY), and an `add` of a
+            // negation they can see the same way. So: add `(0 - v) | z`
+            // where `z` is a wave OR of 0, always 0, which the driver's
+            // compiler does not fold. Found by xcl (xcl-dev/xcl #1905, #1919).
+            Some(Rmw::Sub) => {
+                let c = self.cur;
+                let zero = self.s.m.i32(0);
+                let neg = self.s.m.bin(c, Bin::Sub, zero, v0);
+                let or = self.s.m.i8(1);
+                let i32t = self.s.t.i32;
+                self.s.flags |= flags::WAVE_OPS;
+                let z = self
+                    .s
+                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[zero, or]);
+                let hidden = self.s.m.bin(c, Bin::Or, neg, z);
+                self.s.m.atomic(c, Rmw::Add, p, hidden)
+            }
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
             None => self
