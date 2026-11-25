@@ -91,6 +91,99 @@ fn without_console_flags(desc: Desc) -> Desc {
     }
 }
 
+// Experiment: only substitute a kit-generated blob when it is byte-identical
+// to the host result. The caller still receives the ordinary host result on
+// missing exports, failed calls or any mismatch.
+#[cfg(windows)]
+unsafe fn try_kit_blob(
+    library: &str,
+    symbol: &CStr,
+    host_blob: *mut *mut c_void,
+    invoke: impl FnOnce(usize, *mut *mut c_void, *mut *mut c_void) -> HRESULT,
+) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
+    };
+    if host_blob.is_null() || unsafe { (*host_blob).is_null() } {
+        return false;
+    }
+    static D3D: OnceLock<Option<usize>> = OnceLock::new();
+    static XGS: OnceLock<Option<usize>> = OnceLock::new();
+    let slot = match library {
+        "d3d12_xs.dll" => &D3D,
+        "xgs12_pc_xs.dll" => &XGS,
+        _ => return false,
+    };
+    let Some(module) = *slot.get_or_init(|| {
+        let dir = std::env::var_os("VICTORY_TEST_DLL_DIR")?;
+        let path = std::path::Path::new(&dir).join(library);
+        if !path.is_absolute() {
+            return None;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let module = unsafe {
+            LoadLibraryExW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            )
+        };
+        (!module.is_null()).then_some(module as usize)
+    }) else {
+        return false;
+    };
+    let module = module as *mut c_void;
+    let Some(address) = (unsafe { GetProcAddress(module, symbol.as_ptr().cast()) }) else {
+        return false;
+    };
+    let mut candidate: *mut c_void = std::ptr::null_mut();
+    let mut error: *mut c_void = std::ptr::null_mut();
+    let result = invoke(address as usize, &mut candidate, &mut error);
+    unsafe fn release(p: *mut c_void) {
+        if !p.is_null() {
+            let vt = unsafe { *(p as *const *const *const ()) };
+            let f: unsafe extern "system" fn(*mut c_void) -> u32 =
+                unsafe { std::mem::transmute(*vt.add(2)) };
+            unsafe { f(p) };
+        }
+    }
+    unsafe fn bytes<'a>(p: *mut c_void) -> Option<&'a [u8]> {
+        if p.is_null() {
+            return None;
+        }
+        let vt = unsafe { *(p as *const *const *const ()) };
+        let ptr: unsafe extern "system" fn(*mut c_void) -> *const u8 =
+            unsafe { std::mem::transmute(*vt.add(3)) };
+        let len: unsafe extern "system" fn(*mut c_void) -> usize =
+            unsafe { std::mem::transmute(*vt.add(4)) };
+        let (ptr, len) = unsafe { (ptr(p), len(p)) };
+        if ptr.is_null() || len > 16 * 1024 * 1024 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+    unsafe { release(error) };
+    let same = result >= 0
+        && !candidate.is_null()
+        && matches!((unsafe { bytes(*host_blob) }, unsafe { bytes(candidate) }), (Some(a), Some(b)) if a == b);
+    if same {
+        unsafe {
+            release(*host_blob);
+            *host_blob = candidate;
+        }
+        tracing::info!(library, "kit root signature used after byte comparison");
+    } else {
+        unsafe { release(candidate) };
+        tracing::info!(
+            library,
+            hr = format_args!("{:#x}", result as u32),
+            "kit root signature unavailable or differs; retaining host blob"
+        );
+    }
+    same
+}
+
 /// `d3d12_xs!D3D12SerializeRootSignature`.
 pub extern "system" fn serialize(
     desc: *const Desc,
@@ -108,14 +201,23 @@ pub extern "system" fn serialize(
         return E_NOTIMPL;
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
-        std::mem::transmute::<usize, Serialize>(address)(
-            &without_console_flags(desc),
-            version,
-            blob,
-            error,
-        )
+    let clean = without_console_flags(desc);
+    let hr =
+        unsafe { std::mem::transmute::<usize, Serialize>(address)(&clean, version, blob, error) };
+    #[cfg(windows)]
+    if hr >= 0 {
+        for (library, symbol) in [
+            ("d3d12_xs.dll", c"D3D12SerializeRootSignature"),
+            ("xgs12_pc_xs.dll", c"UMDSerializeRootSignature"),
+        ] {
+            unsafe {
+                try_kit_blob(library, symbol, blob, |f, out, err| {
+                    std::mem::transmute::<usize, Serialize>(f)(&clean, version, out, err)
+                })
+            };
+        }
     }
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -138,7 +240,22 @@ pub extern "system" fn serialize_versioned(
         ..desc
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr =
+        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    #[cfg(windows)]
+    if hr >= 0 {
+        for (library, symbol) in [
+            ("d3d12_xs.dll", c"D3D12SerializeVersionedRootSignature"),
+            ("xgs12_pc_xs.dll", c"UMDSerializeVersionedRootSignature"),
+        ] {
+            unsafe {
+                try_kit_blob(library, symbol, blob, |f, out, err| {
+                    std::mem::transmute::<usize, SerializeVersioned>(f)(&desc, out, err)
+                })
+            };
+        }
+    }
+    hr
 }
 
 type Deserialize =

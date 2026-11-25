@@ -90,11 +90,44 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let shader = victory_shader::emit::translate(c).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        validate_with_local_compiler(&shader);
+        Ok(shader)
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }
+}
+
+/// Experiment: validate a copy of newly translated PC shaders with the local
+/// compiler without mutating or discarding the emulator's output.
+#[cfg(windows)]
+fn validate_with_local_compiler(shader: &HostShader) {
+    use std::cell::RefCell;
+    use victory_shader::emit::validator::Validator;
+    thread_local! {
+        static VALIDATOR: RefCell<Option<Validator>> = RefCell::new({
+            let path = std::env::var_os("VICTORY_TEST_DLL_DIR")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|p| p.join("dxcompiler.dll"));
+            path.and_then(|p| match Validator::load(Some(&p)) {
+                Ok(v) => { tracing::info!(path = %p.display(), "local compiler validator active"); Some(v) }
+                Err(e) => { tracing::warn!(error = %e, "local compiler validator unavailable"); None }
+            })
+        });
+    }
+    VALIDATOR.with(|v| {
+        if let Some(v) = v.borrow_mut().as_mut() {
+            let mut copy = shader.dxil.clone();
+            if let Err(e) = v.validate(&mut copy) {
+                tracing::warn!(error = %e, "local compiler rejected translated shader");
+            }
+        }
+    });
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -326,6 +359,24 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn synthetic_shader_through_local_compiler_validator() {
+        let Some(path) = std::env::var_os("VICTORY_TEST_SYNTHETIC_SHADER") else {
+            return;
+        };
+        assert!(std::env::var_os("VICTORY_TEST_DLL_DIR").is_some());
+        let bytes = std::fs::read(path).expect("read synthetic shader");
+        let mut shader = host_shader(&bytes).expect("translate synthetic shader");
+        let library = std::path::PathBuf::from(std::env::var_os("VICTORY_TEST_DLL_DIR").unwrap())
+            .join("dxcompiler.dll");
+        let mut validator = victory_shader::emit::validator::Validator::load(Some(&library))
+            .expect("load local validator");
+        validator
+            .validate(&mut shader.dxil)
+            .expect("validate translated shader");
+    }
 
     fn shader() -> HostShader {
         HostShader {

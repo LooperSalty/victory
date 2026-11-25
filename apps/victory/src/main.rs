@@ -121,7 +121,32 @@ enum Console {
     SeriesS,
 }
 
+// Local diagnostic only: a loaded module is not automatically used by the emulator.
+#[cfg(windows)]
+fn preload_test_graphics() {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
+    use windows_sys::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
+    let Some(folder) = std::env::var_os("VICTORY_TEST_DLL_DIR").map(PathBuf::from) else { return };
+    if !folder.is_absolute() {
+        eprintln!("[dll-test] folder must be absolute: {}", folder.display());
+        return;
+    }
+    for name in ["xg_xs.dll", "xbsc_xs.dll", "newbe_xs.dll", "xgs12_pc_xs.dll", "d3d12_xs.dll", "dxcompiler.dll", "dxcompiler_xs.dll"] {
+        let path = folder.join(name);
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) };
+        if module.is_null() {
+            eprintln!("[dll-test] load failed: {}: {}", path.display(), std::io::Error::last_os_error());
+        } else {
+            eprintln!("[dll-test] loaded: {}", path.display());
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    preload_test_graphics();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
