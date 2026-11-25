@@ -346,16 +346,18 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). Grand Theft Auto VI calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods 0x1c8 and 0x218 (`SLOT`): `DeserializeGraphicsPipelineStateX`
+/// and `DeserializeComputePipelineStateX`, the readers of what
+/// `SerializePipelineStateX` (0x1c0, 0x210) writes. Grand Theft Auto VI calls
+/// both (title+0x2477578 and title+0x24800d5) as `(this, serialised state,
+/// interface id, out)` and asks for `ID3D12PipelineState`: it offers its
+/// pipeline cache before it makes a pipeline from its description. The
+/// serialised form is the console driver's, of no use to a host driver, so
+/// the calls fail with `out` null and the title makes the pipeline the
+/// usual way (16,384 and 2,048 of these calls fail in the first seconds of
+/// a run that ends with 16 pipelines missing, each for a reason of its own).
+/// XCL answers its slots 57 and 67 the same way.
+/// The first calls log the state's words and what its first word points at.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -388,12 +390,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
+        tracing::info!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a pipeline offered from the title's console pipeline cache (DeserializePipelineStateX) is declined: the title makes it from its description"
         );
     }
     E_NOTIMPL
