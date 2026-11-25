@@ -93,6 +93,9 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+mod split;
+#[cfg(all(test, windows))]
+mod split_tests;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -165,6 +168,51 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Records the host device's widest wave (`WaveLaneCountMax`). Below 64
+/// (NVIDIA: 32 lanes only), a console wave64 compute program that depends
+/// on its lane layout cannot declare `WaveSize(64)`: it takes one of the
+/// 32-lane forms of [`emit`] or, last, runs split: each console wave as two
+/// 32-lane host waves that combine their halves of each cross-lane
+/// operation through group-shared memory (`lower::Split`). Translations
+/// depend on it, so the shader cache must key on [`host_wave_max`]
+/// (`victory-gpu`'s does). The same record as [`set_host_max_wave`].
+pub fn set_host_wave_max(lanes: u32) {
+    lower::set_host_max_wave(lanes);
+}
+
+/// The widest wave translations target: the device's
+/// ([`set_host_wave_max`]; 64 until a device says otherwise), or
+/// `VICTORY_HOST_WAVE_MAX` when set (32 tries split waves on a device that
+/// has 64-lane ones).
+pub fn host_wave_max() -> u32 {
+    let device = match lower::host_max_wave() {
+        0 => 64,
+        lanes => lanes,
+    };
+    parse_wave_max(std::env::var("VICTORY_HOST_WAVE_MAX").ok().as_deref())
+        .map_or(device, |n| n.min(device))
+}
+
+/// `VICTORY_HOST_WAVE_MAX`'s value: 32 or 64, else none. Pure, for testing.
+fn parse_wave_max(value: Option<&str>) -> Option<u32> {
+    match value.map(str::trim) {
+        Some("32") => Some(32),
+        Some("64") => Some(64),
+        _ => None,
+    }
+}
+
+/// Whether a console wave64 compute program that none of the 32-lane forms
+/// of [`emit`] takes off 64-lane waves runs split (`lower::Split`) on a host
+/// without them, instead of declaring a wave size the host refuses.
+/// `VICTORY_WAVE_SPLIT=0` turns that off (the program is then refused by
+/// the host as before). Part of the translation: the shader cache keys on
+/// it (`victory-gpu`'s does).
+pub fn wave_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_SPLIT").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -429,6 +477,23 @@ pub fn emit(
             }
         }
     }
+    // Last, for a console wave64 compute program still on 64-lane waves (or stopped where
+    // not every lane runs) on a host without them: split waves (`lower::Split`, upstream
+    // #1890). Exact where the whole group runs together, each half on its own elsewhere;
+    // without it the host refuses the pipeline. After the forms above, which stay as they
+    // were for the programs they take.
+    if stuck && native.stage == HwStage::Cs && native.wave64 && host_wave_max() < 64 && wave_split() {
+        let split = lower::with_split_waves(|| emit_program(c, native, p, st, io, res));
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &split {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY split waves: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY split waves: {e}"),
+            }
+        }
+        if matches!(&split, Ok((_, wave)) if *wave != Some(64)) {
+            return split.map(|(shader, _)| shader);
+        }
+    }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).
@@ -602,6 +667,8 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        // Split waves only where [`emit`] asks for them, after its other forms.
+        host_wave_max: if lower::split_waves() { host_wave_max() } else { 64 },
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1294,6 +1361,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            host_wave_max: 64,
         })
         .unwrap();
         let mut dxil = l.dxil;

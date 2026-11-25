@@ -177,6 +177,15 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
+    let lanes = emit::host_wave_max();
+    println!(
+        "host waves   up to {lanes} lanes{}",
+        if lanes < 64 {
+            " (console wave64 compute in 32-lane waves, split last)"
+        } else {
+            ""
+        }
+    );
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')

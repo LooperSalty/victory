@@ -63,7 +63,12 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// Identifies the translator independently of the surrounding executable.
+/// Identifies the translator independently of the surrounding executable,
+/// with the settings a translation depends on. The host's widest wave, which
+/// decides whether console wave64 programs are translated for 32-lane waves
+/// (split in two where nothing else takes them), is part of each entry's key
+/// ([`target`]), read when the entry is looked up: after the device has set
+/// it. The switches that change what is done with it are named here.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -84,6 +89,8 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_F16_NEAREST",
             "VICTORY_WAVE_LOCAL",
+            "VICTORY_WAVE_SPLIT",
+            "VICTORY_HOST_WAVE_MAX",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_STRICT_JOINS",
         ] {

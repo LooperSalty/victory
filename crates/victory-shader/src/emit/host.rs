@@ -119,6 +119,25 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
+            // Translations from now on target this device's widest wave
+            // (console wave64 in 32-lane waves without 64-lane ones), as
+            // `victory-gpu` does. Not in this crate's tests, which pick the
+            // width they lower for themselves (`lower::TEST_HOST_WAVE`,
+            // `Parts::host_wave_max`) whatever devices other tests make.
+            #[cfg(not(test))]
+            {
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+                if device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+                {
+                    super::set_host_wave_max(options.WaveLaneCountMax);
+                }
+            }
             Ok(Host { device })
         }
     }

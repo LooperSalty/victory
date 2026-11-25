@@ -74,6 +74,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave_max: 64,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.

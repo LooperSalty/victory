@@ -572,16 +572,9 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
-        // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
-        // cross-lane code stays in 32-lane halves translated for waves of 32
-        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        if device
-            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
-            .is_ok()
-        {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
-        }
+        // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs
+        // translated for waves of 32 (`victory_shader::emit::emit`'s forms, split waves last)
+        record_wave_lanes(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -637,6 +630,35 @@ fn create() -> windows::core::Result<Host> {
             adapter,
         })
     }
+}
+
+/// Tells the translator the device's wave widths (`WaveLaneCountMin/Max`):
+/// without 64-lane waves (NVIDIA), console wave64 programs that need their
+/// lane layout are translated for 32-lane waves (split over two of them
+/// where no other form takes them). Logged
+/// once; before any shader is translated (the shader cache keys on it).
+fn record_wave_lanes(device: &ID3D12Device) {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the query writes its own structure of the given size.
+    let ok = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+    };
+    // Unknown: assume the narrowest wave the split translation needs.
+    let max = if ok { options.WaveLaneCountMax } else { 32 };
+    victory_shader::emit::set_host_wave_max(max);
+    let used = victory_shader::emit::host_wave_max();
+    tracing::info!(
+        min = options.WaveLaneCountMin,
+        max,
+        wave64_in_halves = used < 64,
+        "host wave lanes"
+    );
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).

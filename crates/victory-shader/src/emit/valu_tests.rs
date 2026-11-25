@@ -168,6 +168,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave_max: 64,
     })
     .expect("lower");
 
@@ -1344,6 +1345,7 @@ fn wave_prefix_f32_uses_signed_flag_and_validates() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave_max: 64,
     })
     .unwrap();
     assert!(l.wave_ops, "expected wave prefix lowering");
@@ -1514,6 +1516,7 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave_max: 64,
     })
     .unwrap();
     let mut dxil = l.dxil;
