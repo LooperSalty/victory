@@ -45,6 +45,9 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The bytes the buffer was made with when it is one of the pool's
+    /// (`pool_mb`), 0 otherwise.
+    class: u64,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -392,6 +395,97 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Nothing reads the buffer any more (a list that copied from it
+        // held this until its reset): kept for the next texture of its size.
+        if self.class != 0 {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            if POOLED.load(Relaxed) + self.class <= pool_mb() << 20 {
+                POOLED.fetch_add(self.class, Relaxed);
+                pool.get_or_insert_with(HashMap::new)
+                    .entry(self.class)
+                    .or_default()
+                    .push((self.buffer.clone(), self.data as usize));
+            }
+        }
+    }
+}
+
+/// Staging buffers let go, by the bytes they were made with, and the bytes
+/// of all of them: the textures picked by index take a new staging buffer at
+/// every upload (`draw::heap_textures` lets it go once the list has it), a
+/// committed resource made and mapped each time.
+type Pool = HashMap<u64, Vec<(ID3D12Resource, usize)>>;
+static POOL: Mutex<Option<Pool>> = Mutex::new(None);
+static POOLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_STAGING_POOL_MB`: the most megabytes of staging buffers kept
+/// for reuse (0 by default: none kept, every one made anew).
+fn pool_mb() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// The size a pooled staging buffer of `bytes` is made with: the next of
+/// 1, 1.25, 1.5 and 1.75 times a power of two, 64 KiB at least, so that
+/// buffers of nearby sizes serve one another.
+fn pool_class(bytes: u64) -> u64 {
+    let bytes = bytes.max(64 << 10);
+    let top = 1u64 << (63 - bytes.leading_zeros());
+    (0..4)
+        .map(|q| top + q * (top / 4))
+        .find(|&c| c >= bytes)
+        .unwrap_or(top * 2)
+}
+
+/// A staging buffer of at least `bytes`, mapped: one of the pool's, zeroed
+/// as a new one is (a texture not all mapped leaves parts unwritten), or a
+/// new one. With the bytes it was made with (0: not for the pool).
+fn pooled_buffer(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    if pool_mb() == 0 {
+        let (buffer, data) = host.upload_buffer(bytes)?;
+        return Some((buffer, data, 0));
+    }
+    let class = pool_class(bytes);
+    let kept = POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|pool| pool.get_mut(&class)?.pop());
+    if let Some((buffer, data)) = kept {
+        POOLED.fetch_sub(class, std::sync::atomic::Ordering::Relaxed);
+        POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the buffer's mapping, `class` bytes, which nothing else holds.
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, bytes as usize) };
+        return Some((buffer, data as *mut u8, class));
+    }
+    let (buffer, data) = host.upload_buffer(class)?;
+    Some((buffer, data, class))
+}
+
+/// Staging buffers taken from the pool so far.
+pub(crate) static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod pool_tests {
+    use super::pool_class;
+
+    #[test]
+    fn a_class_holds_its_bytes_and_wastes_less_than_a_quarter() {
+        assert_eq!(pool_class(0), 64 << 10);
+        assert_eq!(pool_class(64 << 10), 64 << 10);
+        assert_eq!(pool_class((64 << 10) + 1), 80 << 10);
+        assert_eq!(pool_class(1 << 20), 1 << 20);
+        assert_eq!(pool_class((1 << 20) + 1), (1 << 20) + (256 << 10));
+        assert_eq!(pool_class((7 << 18) + 1), 2 << 20);
+        for bytes in [70_000u64, 123_456, 1_000_000, 5_592_404, 89_478_484] {
+            let class = pool_class(bytes);
+            assert!(class >= bytes && class - bytes < bytes / 4 + 1, "{bytes} -> {class}");
+        }
     }
 }
 
@@ -1038,7 +1132,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, class) = pooled_buffer(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1058,6 +1152,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
+        class,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

@@ -5217,8 +5217,16 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Textures to bring up to date, held back until a step writes title
+        // memory or the list's steps end, so that several can be read and
+        // detiled at once (`refresh_textures`). The host-only steps between
+        // them only set a texture's own flags.
+        let mut textures: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            if matches!(step, Step::Copy(..) | Step::Run(_)) {
+                refresh_textures(&mut textures);
+            }
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -5286,7 +5294,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        textures.push(staging.clone());
                     }
                     continue;
                 }
@@ -5294,7 +5302,42 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        refresh_textures(&mut textures);
     }
+}
+
+/// Brings the staging buffers of `textures` up to date and empties the list.
+///
+/// One after the other on the submitting thread by default. With
+/// `VICTORY_WIDE_TEXTURES=<threads>` (2 or more) and four textures or more,
+/// on that many threads: each texture has its own staging buffer, and its
+/// refresh only reads title memory (read, hash, detile).
+fn refresh_textures(textures: &mut Vec<std::sync::Arc<crate::texture::Staging>>) {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_TEXTURES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    });
+    if threads < 2 || textures.len() < 4 {
+        for staging in textures.drain(..) {
+            staging.refresh();
+        }
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let all = &textures[..];
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(all.len()) {
+            scope.spawn(|| {
+                while let Some(staging) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    staging.refresh();
+                }
+            });
+        }
+    });
+    textures.clear();
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
